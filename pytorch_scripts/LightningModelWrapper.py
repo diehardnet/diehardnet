@@ -26,8 +26,8 @@ class ModelWrapper(pl.LightningModule):
 
         self.save_hyperparameters('model', 'n_classes', 'optim', 'loss')
 
-    def forward(self, x, inject=True):
-        return self.model(x, inject, self.current_epoch)
+    def forward(self, x):
+        return self.model(x)
 
     def configure_optimizers(self):
         if self.optim['optimizer'] == 'sgd':
@@ -43,13 +43,15 @@ class ModelWrapper(pl.LightningModule):
     def get_metrics(self, batch, inject=True):
         x, y = batch
 
+        self.model.to_be_injected = inject
+
         # forward
-        outputs = self(x, inject)
+        outputs = self(x)
 
         # loss
         if self.use_one_hot and not self.training:
             # bce or sce
-            loss = self.criterion(outputs, get_one_hot(y, self.n_classes))
+            loss = self.criterion(outputs, self.get_one_hot(y, self.n_classes))
         else:
             # ce
             loss = self.criterion(outputs, y)
@@ -68,17 +70,6 @@ class ModelWrapper(pl.LightningModule):
         self.epoch_log('train_acc', acc)
         return loss
 
-    def check_criticality(self, gold: tuple, faulty: tuple):
-        gold_vals, gold_preds = gold
-        fault_vals, fault_preds = faulty
-        # Magic number to define whats is an zero
-        err_lambda = 1e-4
-        # Check if the sum of diffs are
-        value_diff_pct = torch.sum(torch.abs(gold_vals - fault_vals) > err_lambda) / gold_vals.shape[0]
-        preds_diff_pct = torch.sum(gold_preds != fault_preds) / gold_vals.shape[0]
-        self.epoch_log('value_diff_pct', value_diff_pct)
-        self.epoch_log('preds_diff_pct', preds_diff_pct)
-
     def validation_step(self, val_batch, batch_idx, check_criticality=True):
         loss, acc, clean_vals = self.get_metrics(val_batch, False)
         noisy_loss, noisy_acc, noisy_vals = self.get_metrics(val_batch)
@@ -93,17 +84,29 @@ class ModelWrapper(pl.LightningModule):
         return noisy_loss
 
     def on_train_epoch_start(self):
+        self.model.current_epoch = self.current_epoch
         lr = self.optimizers().param_groups[0]['lr']
         self.epoch_log('lr', lr)
 
     def epoch_log(self, name, value, prog_bar=True):
         self.log(name, value, on_step=False, on_epoch=True, prog_bar=prog_bar)
 
+    def check_criticality(self, gold: tuple, faulty: tuple):
+        gold_vals, gold_preds = gold
+        fault_vals, fault_preds = faulty
+        # Magic number to define what is a zero
+        err_lambda = 1e-4
+        # Check if the sum of diffs are
+        value_diff_pct = torch.sum(torch.abs(gold_vals - fault_vals) > err_lambda) / gold_vals.shape[0]
+        preds_diff_pct = torch.sum(gold_preds != fault_preds) / gold_vals.shape[0]
+        self.epoch_log('value_diff_pct', value_diff_pct)
+        self.epoch_log('preds_diff_pct', preds_diff_pct)
 
-def get_one_hot(target, n_classes=10, device='cuda'):
-    one_hot = torch.zeros(target.shape[0], n_classes, device=device)
-    one_hot = one_hot.scatter(dim=1, index=target.long().view(-1, 1), value=1.)
-    return one_hot
+    @staticmethod
+    def get_one_hot(target, n_classes=10, device='cuda'):
+        one_hot = torch.zeros(target.shape[0], n_classes, device=device)
+        one_hot = one_hot.scatter(dim=1, index=target.long().view(-1, 1), value=1.)
+        return one_hot
 
 
 class SymmetricCELoss(nn.Module):

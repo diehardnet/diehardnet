@@ -1,31 +1,30 @@
+import platform
+import re
 import yaml
 from timm.data import create_loader, FastCollateMixup
 
 from .LightningModelWrapper import ModelWrapper
-from .hard_resnet import *
-from .hard_densenet import *
+
+from pytorch_scripts.hg_noise_injector.hook_injection import Injector
 
 
-def build_model(model='hard_resnet20', n_classes=10, optim_params={}, loss='bce', error_model='random', inject_p=0.1, inject_epoch=0,
-                order='relu-bn', activation='relu', nan=False, affine=True):
-    if model == 'hard_resnet20':
-        net = hard_resnet20(n_classes, error_model, inject_p, inject_epoch, order, activation, nan, affine)
-    elif model == 'hard_resnet32':
-        net = hard_resnet32(n_classes, error_model, inject_p, inject_epoch, order, activation, nan, affine)
-    elif model == 'hard_resnet44':
-        net = hard_resnet44(n_classes, error_model, inject_p, inject_epoch, order, activation, nan, affine)
-    elif model == 'densenet100':
-        net = densenet100(n_classes)
-    else:
-        model = 'hard_resnet20'
-        net = hard_resnet20(n_classes, error_model, inject_p, inject_epoch, order, activation, nan, affine)
+def build_model(model=None, n_classes=10, optim_params={}, loss='bce', error_model='random', inject_p=0.1, inject_epoch=0,
+                clip=False, nan=False):
 
+    if model == 'resnet50':
+        from torchvision.models import resnet50
+        model = resnet50(weights="IMAGENET1K_V2")
+    elif model == 'efficientnet':
+        from torchvision.model import efficientnet_v2_s
+        model = efficientnet_v2_s(weights='IMAGENET1K_V1')
+
+    net = Injector(model, error_model, inject_p, inject_epoch, clip, nan)
     print(f'\n==> {model} built.')
     return ModelWrapper(net, n_classes, optim_params, loss)
 
 
 def get_loader(data, batch_size=128, workers=4, n_classes=100, stats=None, mixup_cutmix=True, rand_erasing=0.0,
-               label_smooth=0.1, rand_aug='rand-m9-mstd0.5-inc1', jitter=0.0, size=32):
+               label_smooth=0.1, rand_aug='rand-m9-mstd0.5-inc1', jitter=0.0, rcc=0.75, size=32, fp16=True):
     if mixup_cutmix:
         mixup_alpha = 0.8
         cutmix_alpha = 1.0
@@ -48,7 +47,7 @@ def get_loader(data, batch_size=128, workers=4, n_classes=100, stats=None, mixup
                          re_mode='pixel',
                          re_count=1,
                          re_split=False,
-                         scale=[0.75, 1.0],
+                         scale=[rcc, 1.0],  #[0.08, 1.0] if size != 32 else [0.75, 1.0],
                          ratio=[3./4., 4./3.],
                          hflip=0.5,
                          vflip=0,
@@ -59,11 +58,11 @@ def get_loader(data, batch_size=128, workers=4, n_classes=100, stats=None, mixup
                          mean=stats[0],
                          std=stats[1],
                          num_workers=workers,
-                         distributed=False,
+                         distributed=True,
                          collate_fn=collate,
                          pin_memory=True,
                          use_multi_epochs_loader=False,
-                         fp16=False)
+                         fp16=fp16)
 
 
 def parse_args(parser, config_parser):
@@ -79,3 +78,38 @@ def parse_args(parser, config_parser):
     args = parser.parse_args(remaining)
 
     return args
+
+
+def get_default_data_root():
+    node = platform.node()
+
+    sysname = node
+    if re.match(r'compute-\d+-\d+', sysname):
+        sysname = 'legion'
+    elif re.match(r'node\d', sysname):
+        sysname = 'clustervandal'
+    elif re.match(r'r\d+n\d+', sysname):
+        sysname = 'marconi100'
+    elif re.match(r'^(?:[fg]node|franklin)\d{2}$', sysname):
+        sysname = 'franklin'
+
+    # TODO Percorsi dei dataset sulle nostre macchine.
+    paths = {
+        # Lab workstations
+        'demetra': '/data/lucar/datasets',
+        'poseidon': '/data/lucar/datasets',
+        'nike': '/home/lucar/datasets',
+        'athena': '/home/lucar/datasets',
+        'terpsichore': '/data/lucar/datasets',
+        'atlas': '/data/lucar/datasets',
+        'kronos': '/data/datasets',
+
+        # Clusters
+        'legion': '/home/lrobbiano/datasets',
+        'franklin': '/projects/vandal/nas/datasets',
+
+        # Personal (for debugging)
+        'carbonite': '/home/luca/datasets'
+    }
+
+    return paths.get(sysname, None)

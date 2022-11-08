@@ -1,0 +1,31 @@
+name: finetuning_test_2
+mode: validation
+ckpt: null
+dataset: ImageNet
+num_gpus: 1
+
+model: resnet50
+model_clip: false
+nan: false
+
+loss: bce
+grad_clip: 2.0
+epochs: 15
+batch_size: 32
+lr: 1e-5
+optimizer: adamw
+
+error_model: random
+inject_p: 0.1
+inject_epoch: 0
+
+wd: 1e-5
+rcc: 0.75
+rand_aug: null
+rand_erasing: 0.0
+mixup_cutmix: false
+jitter: 0.0
+label_smooth: 0.0
+
+seed: 0
+comment: test

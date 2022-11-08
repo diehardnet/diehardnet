@@ -5,10 +5,11 @@ import warnings
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.loggers import WandbLogger
+from pytorch_lightning.strategies.ddp import DDPStrategy
 
 # DieHardNET packages
 from pytorch_scripts.utils import *
-from pytorch_scripts.cifar_data_module import CifarDataModule
+from pytorch_scripts.data_module import DataModule
 
 # Suppress the annoying warning for non-empty checkpoint directory
 warnings.filterwarnings("ignore")
@@ -21,35 +22,36 @@ parser = argparse.ArgumentParser(description='PyTorch Training')
 
 
 # General
-parser.add_argument('--name', default='test', help='Experiment name.')
-parser.add_argument('--mode', default='train', help='Mode: train/training or validation/validate.')
-parser.add_argument('--ckpt', default=None, help='Pass the name of a checkpoint to resume training.')
-parser.add_argument('--dataset', default='cifar10', help='Dataset name: cifar10 or cifar100.')
-parser.add_argument('--data_dir', default='./data', help='Path to dataset.')
-parser.add_argument('--device', default=1, help='Device number.')
-
-# Optimization
-parser.add_argument('--loss', default='bce', help='Loss: bce, ce or sce.')
-parser.add_argument('--clip', default=None, help='Gradient clipping value.')
-parser.add_argument('--epochs', default=150, help='Number of epochs.')
-parser.add_argument('--batch_size', default=128, help='Batch Size')
-parser.add_argument('--lr', default=1e-1, help='Learning rate.')
-parser.add_argument('--optimizer', default='sgd', help='Optimizer name: adamw or sgd.')
+parser.add_argument('--name', type=str, default='test', help='Experiment name.')
+parser.add_argument('--mode', type=str, default='train', help='Mode: train/training or validation/validate.')
+parser.add_argument('--ckpt', type=str, default=None, help='Pass the name of a checkpoint to resume training.')
+parser.add_argument('--dataset', type=str, default='cifar10', help='Dataset name: cifar10 or cifar100.')
+parser.add_argument('--size', type=int, default=224, help='Image size.')
+parser.add_argument('--precision', type=int, default=16, help='Whether to use Mixed Precision or not.')
+parser.add_argument('--data_dir', type=str, default=None, help='Path to dataset.')
+parser.add_argument('--num_gpus', type=int, default=1, help='Number of GPUs.')
 
 # Model
-parser.add_argument('--model', default='resnet20', help='Network name. Resnets only for now.')
-parser.add_argument('--order', default='bn-relu', help='Order of activation and normalization: bn-relu or relu-bn.')
-parser.add_argument('--affine', default=True, help='Whether to use Affine transform after normalization or not.')
-parser.add_argument('--activation', default='relu', help='Non-linear activation: relu or relu6.')
-parser.add_argument('--nan', default=False, help='Whether to convert NaNs to 0 or not.')
+parser.add_argument('--model', type=str, default='resnet20', help='Network name. Resnets only for now.')
+parser.add_argument('--model_clip', type=bool, default=False, help='Whether to clip layer outputs or not.')
+parser.add_argument('--nan', type=bool, default=False, help='Whether to convert NaNs to 0 or not.')
+
+# Optimization
+parser.add_argument('--loss', type=str, default='bce', help='Loss: bce, ce or sce.')
+parser.add_argument('--grad_clip', default=None, help='Gradient clipping value.')
+parser.add_argument('--epochs', type=int, default=150, help='Number of epochs.')
+parser.add_argument('--batch_size', type=int, default=128, help='Batch Size')
+parser.add_argument('--lr', type=float, default=1e-1, help='Learning rate.')
+parser.add_argument('--optimizer', type=str, default='sgd', help='Optimizer name: adamw or sgd.')
 
 # Injection
-parser.add_argument('--error_model', default='random', help='Optimizer name: adamw or sgd.')
-parser.add_argument('--inject_p', default=0.1, help='Probability of noise injection at training time.')
-parser.add_argument('--inject_epoch', default=0, help='How many epochs before starting the injection.')
+parser.add_argument('--error_model', type=str, default='random', help='Optimizer name: adamw or sgd.')
+parser.add_argument('--inject_p', type=float, default=0.1, help='Probability of noise injection at training time.')
+parser.add_argument('--inject_epoch', type=float, default=0, help='How many epochs before starting the injection.')
 
 # Augmentations and Regularisations
-parser.add_argument('--wd', default=1e-4, help='Weight Decay.')
+parser.add_argument('--wd', type=float, default=1e-4, help='Weight Decay.')
+parser.add_argument('--rcc', type=float, default=0.75, help='RCC lower bound.')
 parser.add_argument('--rand_aug', type=str, default=None, help='RandAugment magnitude and std.')
 parser.add_argument('--rand_erasing', type=float, default=0.0, help='Random Erasing propability.')
 parser.add_argument('--mixup_cutmix', type=bool, default=False, help='Whether to use mixup/cutmix or not.')
@@ -62,6 +64,7 @@ parser.add_argument('--seed', default=0, help='Random seed for reproducibility.'
 parser.add_argument('--comment', default='ResNet trained with original settings but the scheduler.',
                     help='Optional comment.')
 
+n_classes = {'cifar10': 10, 'cifar100': 100, 'ImageNet': 1000}
 
 def main():
     args = parse_args(parser, config_parser)
@@ -70,14 +73,15 @@ def main():
     pl.seed_everything(args.seed, workers=True)
 
     augs = {'rand_aug': args.rand_aug, 'rand_erasing': args.rand_erasing, 'mixup_cutmix': args.mixup_cutmix,
-            'jitter': args.jitter, 'label_smooth': args.label_smooth}
-    cifar = CifarDataModule(args.dataset, args.data_dir, args.batch_size, 1, augs)
+            'jitter': args.jitter, 'label_smooth': args.label_smooth, 'rcc': args.rcc}
+    root = args.data_dir or get_default_data_root()
+    cifar = DataModule(args.dataset, root, args.batch_size, args.num_gpus,
+                       size=args.size, augs=augs, fp16=args.precision)
 
     # Build model (Resnet only up to now)
     optim_params = {'optimizer': args.optimizer, 'epochs': args.epochs, 'lr': args.lr, 'wd': args.wd}
-    n_classes = 10 if args.dataset == 'cifar10' else 100
-    net = build_model(args.model, n_classes, optim_params, args.loss, args.error_model, args.inject_p,
-                      args.inject_epoch, args.order, args.activation, args.nan, args.affine)
+    net = build_model(args.model, n_classes[args.dataset], optim_params, args.loss, args.error_model, args.inject_p,
+                      args.inject_epoch, args.model_clip, args.nan)
 
     # W&B logger
     wandb_logger = WandbLogger(project="NeutronRobustness", name=args.name, id=args.name, entity="neutronstrikesback")
@@ -89,9 +93,10 @@ def main():
     callbacks = [ckpt_callback]
 
     # Pytorch-Lightning Trainer
-    trainer = pl.Trainer(max_epochs=args.epochs, devices=[int(args.device)], callbacks=callbacks, logger=wandb_logger,
-                         deterministic=True, benchmark=True, accelerator='gpu', strategy="dp", sync_batchnorm=True,
-                         gradient_clip_val=args.clip)
+    trainer = pl.Trainer(max_epochs=args.epochs, devices=args.num_gpus, callbacks=callbacks, logger=wandb_logger,
+                         deterministic=True, benchmark=True, accelerator='gpu', sync_batchnorm=True,
+                         gradient_clip_val=args.grad_clip, strategy=DDPStrategy(find_unused_parameters=False),
+                         precision=args.precision)
 
     if args.ckpt:
         #args.ckpt = '~/Dropbox/DieHardNet/Checkpoints/' + args.ckpt
